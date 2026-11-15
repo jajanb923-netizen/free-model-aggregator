@@ -28,20 +28,30 @@
 //   For each request the server picks the best free model that meets the request's
 //   requirements, then re-picks on every refusal, so the choice is always a function of the
 //   requests and the answers seen so far (a replay makes the same choices). The pick is by a
-//   soft-spread score: the model's rating in the quality table, less 8 milli-points for each
-//   call already made to its provider, ties broken by fewer calls made, then provider id,
-//   then model id. A provider's first call always answers (the failure schedule and the
-//   outage both start at its second call), so spreading the load across the providers costs
-//   fewer provider calls — the tie-break among equal scores — while giving up a little
-//   rating. The penalty of 8 was chosen by simulating the routing over 100 freshly drawn
-//   instances with the kit's own generator (~/workspace/free-model-aggregator-runs/sim/):
-//   quality 99 and score 99 on every one, served 100 and failover 100, at 26.9 calls a
-//   trial against the pure-rating order's 29.1. A provider that refuses three calls in a
-//   row is treated as spent for the rest of the trial: its budget is gone or it is in
-//   outage, and the one or two failures a failure schedule costs never reach three in a
-//   row, so a live provider is never written off. The trial's providers are never probed
-//   for their budgets (the brief does not carry them), so the server learns them from the
-//   refusals it meets.
+//   soft-spread score: the model's rating in the quality table, less 12 milli-points for
+//   each call already made to its provider, divided by the request's weight (a weight-2
+//   request is worth twice a weight-1 one, so its quality counts double), plus 15
+//   milli-points when the provider has not been called yet this trial — a fresh provider's
+//   first call always answers, so a fresh provider is a free good model — ties broken by
+//   fewer calls made, then provider id, then model id. When one call is refused the server
+//   retries the SAME candidate up to twice before failing over: a refusal is usually a
+//   transient fail_call on a small-budget provider, and a retry on the same (best) model
+//   costs one call, while a failover to the next model costs a call AND a rating drop — and
+//   a request whose scarce-capability providers all refuse is the one way a trial loses a
+//   request, so the retries are what keep served at 100. A provider that refuses three
+//   calls in a row is treated as spent for the rest of the trial: its budget is gone or it
+//   is in outage. The trial's providers are never probed for their budgets (the brief does
+//   not carry them), so the server learns them from the refusals it meets. The policy was
+//   chosen by simulating the routing over 500 freshly drawn instances with the kit's own
+//   generator (~/workspace/free-model-aggregator-runs/sim/sim3.mjs, grid6): the integer
+//   trial score is 99 on 500/500 instances at 26.37 upstream calls a trial, against the
+//   v2 policy's 27.26 calls and a score of 99 on only 499/500 (v2 leaves one request
+//   unserved on instance in-314: quality 91, trial score 92). The retries are the
+//   robustness: every no-retry policy in the sweep leaves a request unserved somewhere in
+//   the 500, every retry policy leaves none. A trial scores 99 as long as its quality is
+//   98 or better (loss at most 764), so the retry policies' worst observed loss, 408,
+//   keeps a comfortable margin; the policies that save more calls by spreading harder
+//   (penalty 20) push that worst loss to 619, so 12 is where the saving stops growing.
 //
 // THE WIRES
 //   Every provider answers with the same text: `ANSWER ECHO` plus a JSON echo of what it was
@@ -107,8 +117,12 @@ const CALL_TIMEOUT_MS = 10000;
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
 /** Consecutive refusals after which a provider is treated as spent for the trial. */
 const DEAD_AFTER_FAILURES = 3;
-/** Reuse penalty, in milli-points per call already made to a provider (see ROUTING). */
-const REUSE_PENALTY_MILLI = 8;
+/** Reuse penalty, in milli-points per call already made to a provider, divided by the request's weight (see ROUTING). */
+const REUSE_PENALTY_MILLI = 12;
+/** Extra score, in milli-points, for a provider that has not been called yet this trial (see ROUTING). */
+const FRESH_PROVIDER_BONUS_MILLI = 15;
+/** Same-candidate retries after a refusal before failing over to the next best model (see ROUTING). */
+const SAME_CANDIDATE_RETRIES = 2;
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
@@ -172,11 +186,13 @@ interface Candidate {
 /**
  * The best candidate not yet tried for one request under the soft-spread score: the
  * model's rating less REUSE_PENALTY_MILLI for each call already made to its provider,
- * ties broken by fewer calls made, then provider id, then model id. An OpenAI client
- * asking for JSON mode is never offered an Anthropic-wire provider: that wire's parser
- * never echoes JSON mode, so its answer would fail the JSON check.
+ * divided by the request's weight, plus FRESH_PROVIDER_BONUS_MILLI when the provider has
+ * not been called yet this trial; ties broken by fewer calls made, then provider id, then
+ * model id. An OpenAI client asking for JSON mode is never offered an Anthropic-wire
+ * provider: that wire's parser never echoes JSON mode, so its answer would fail the JSON
+ * check.
  */
-function pickCandidate(requires: Requirement, canon: CanonRequest, tried: Set<string>): Candidate | null {
+function pickCandidate(requires: Requirement, canon: CanonRequest, tried: Set<string>, weight: number): Candidate | null {
   let best: Candidate | null = null;
   let bestScore: [number, number] | null = null;
   for (const probe of probes) {
@@ -191,7 +207,10 @@ function pickCandidate(requires: Requirement, canon: CanonRequest, tried: Set<st
       const key = `${probe.provider.id}::${model.id}`;
       if (tried.has(key)) continue;
       const rating = row?.rating_milli ?? 0;
-      const score: [number, number] = [rating - REUSE_PENALTY_MILLI * state.callsMade, -state.callsMade];
+      const score: [number, number] = [
+        rating - (REUSE_PENALTY_MILLI * state.callsMade) / weight + (state.callsMade === 0 ? FRESH_PROVIDER_BONUS_MILLI : 0),
+        -state.callsMade,
+      ];
       if (
         best === null ||
         bestScore === null ||
@@ -210,15 +229,15 @@ function pickCandidate(requires: Requirement, canon: CanonRequest, tried: Set<st
   return best;
 }
 
-/** The requirements of the request now arriving: the manifest's row by arrival order, else the body's own. */
-function requirementsFor(body: Json): Requirement {
+/** The requirements and the weight of the request now arriving: the manifest's row by arrival order, else the body's own (weight 1). */
+function requirementsFor(body: Json): { requires: Requirement; weight: number } {
   const manifest = brief.workload?.manifest ?? [];
   const entry = manifest[manifestIndex];
   manifestIndex += 1;
-  if (entry !== undefined) return entry.requires;
+  if (entry !== undefined) return { requires: entry.requires, weight: entry.weight };
   // The manifest is the declared source of each request's requirements; this fallback is a
   // guess for a brief that holds none.
-  return requirementsFromBody(body);
+  return { requires: requirementsFromBody(body), weight: 1 };
 }
 
 /** Requirements read off a request body, when the manifest has no row for it. */
@@ -334,13 +353,25 @@ interface Served {
 
 /**
  * Serve one request: pick the best candidate under the soft-spread score, call it, and
- * re-pick on every refusal until one answers. A provider that refuses three calls in a
- * row is skipped from here on. Returns null only when no candidate answered.
+ * retry the same candidate up to SAME_CANDIDATE_RETRIES times on a refusal before
+ * re-picking — a refusal is usually a transient fail_call, and a retry on the same
+ * (best) model costs one call where a failover costs a call and a rating drop. A
+ * provider that refuses three calls in a row is skipped from here on. Returns null only
+ * when no candidate answered.
  */
-async function serve(canon: CanonRequest, requires: Requirement): Promise<Served | null> {
+async function serve(canon: CanonRequest, requires: Requirement, weight: number): Promise<Served | null> {
   const tried = new Set<string>();
+  let retryCandidate: Candidate | null = null;
+  let retriesLeft = 0;
   for (;;) {
-    const candidate = pickCandidate(requires, canon, tried);
+    let candidate: Candidate | null;
+    if (retryCandidate !== null) {
+      candidate = retryCandidate;
+      retryCandidate = null;
+    } else {
+      candidate = pickCandidate(requires, canon, tried, weight);
+      retriesLeft = SAME_CANDIDATE_RETRIES;
+    }
     if (candidate === null) return null;
     const state = healthOf(candidate.probe.provider.id);
     state.callsMade += 1;
@@ -355,6 +386,11 @@ async function serve(canon: CanonRequest, requires: Requirement): Promise<Served
       state.dead = true;
       log(`${candidate.probe.provider.id} refused ${DEAD_AFTER_FAILURES} calls in a row; treating it as spent`);
     }
+    if (retriesLeft > 0 && !state.dead) {
+      retriesLeft -= 1;
+      retryCandidate = candidate;
+      continue;
+    }
   }
 }
 
@@ -363,7 +399,8 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
   const canon = parseOpenAIRequest(body);
-  const served = await serve(canon, requirementsFor(body));
+  const { requires, weight } = requirementsFor(body);
+  const served = await serve(canon, requires, weight);
   if (served === null) return sendError(res, 'openai', 503, 'no_free_model', 'no free model on the directory meets this request');
   if (canon.stream) {
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
@@ -378,7 +415,8 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
   const body = await readJson(req);
   if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
   const canon = parseAnthropicRequest(body);
-  const served = await serve(canon, requirementsFor(body));
+  const { requires, weight } = requirementsFor(body);
+  const served = await serve(canon, requires, weight);
   if (served === null) return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model on the directory meets this request');
   if (canon.stream) {
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
